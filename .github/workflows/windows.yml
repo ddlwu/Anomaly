@@ -1,46 +1,193 @@
-name: Build Anomaly (Runtime, SDK, Tools)
+# 在 GitHub 托管的 Windows runner 上从源码构建 Anomaly，并输出三个发布组件：
+#   Anomaly-<version>-runtime.zip
+#   Anomaly-<version>-sdk.zip
+#   Anomaly-<version>-tools.zip
+# 以及 SHA256SUMS.txt、release-manifest.json、sbom/*.spdx.json。
+#
+# 构建路径严格遵循 docs/developer-guide/building.md 里“唯一受支持的构建路径”：
+#   1) cmake --preset windows-vs2022
+#   2) cmake --build --preset windows-relwithdebinfo
+#   3) tools/package_release.ps1（正式发布打包，Runtime/SDK/Tools 三个组件 ZIP）
+# 不新建 NMake / Ninja / 按阶段命名的构建树，也不手写 install 命令来拼组件。
+name: Build Runtime, SDK and Tools
 
 on:
   workflow_dispatch:
+    inputs:
+      version:
+        description: '发布版本（SemVer，如 1.0.0）。留空则取 tag 名，非 tag 触发时用 1.0.0'
+        required: false
+        type: string
+        default: ''
+  push:
+    tags:
+      - 'v*'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: pwsh
 
 jobs:
   build:
-    runs-on: windows-2022 # 固定使用自带 VS 2022 的镜像环境
-
+    name: Build components (windows-2022)
+    runs-on: windows-2022
+    # 全量构建 Runtime + Tools + SDK 及其内建插件，首次约 30-60 分钟。
+    timeout-minutes: 240
+    env:
+      BUILD_DIR: .build\windows-vs2022
+      RELEASE_ROOT: .build\release
+      INPUT_VERSION: ${{ inputs.version }}
     steps:
-    - name: 1. 获取代码
-      uses: actions/checkout@v4
-      with:
-        submodules: recursive
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # package_release.ps1 会记录源提交与其提交时间，需要完整的 git 历史。
+          fetch-depth: 0
+          submodules: recursive
 
-    - name: 2. 初始化 Visual Studio 编译环境
-      shell: cmd
-      run: |
-        call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\Common7\Tools\VsDevCmd.bat"
-        cmake --version
+      - name: Resolve release version
+        id: version
+        run: |
+          $raw = $env:INPUT_VERSION
+          if ($null -eq $raw) { $raw = '' }
+          $version = $raw.Trim()
+          if (-not $version -and $env:GITHUB_REF_TYPE -eq 'tag') {
+            $version = $env:GITHUB_REF_NAME -replace '^v', ''
+          }
+          if (-not $version) { $version = '1.0.0' }
 
-    - name: 3. 运行官方构建脚本 (编译 Runtime 与 Tools)
-      shell: cmd
-      run: |
-        call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\Common7\Tools\VsDevCmd.bat"
-        call .\build.cmd
+          # 与 tools/package_release.ps1 的校验保持一致：它拒绝非 SemVer，
+          # 并要求主版本号等于 CMake 配置出的 CMAKE_PROJECT_VERSION。
+          $semver = '^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$'
+          if ($version -notmatch $semver) {
+            throw "不是合法的 SemVer 版本号: '$version'"
+          }
 
-    - name: 4. 提取并安装 SDK 组件
-      shell: cmd
-      run: |
-        call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\Common7\Tools\VsDevCmd.bat"
-        cmake --install .build\windows-vs2022 --config RelWithDebInfo --prefix .build\sdk-package --component SDK
+          # 用 ASCII 追加，避免 Windows PowerShell 5.1 的 utf8 编码给 GITHUB_OUTPUT 写入 BOM。
+          "version=$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding ascii
+          Write-Host "Release version: $version"
 
-    - name: 5. 上传 Runtime 与 Tools 运行包
-      uses: actions/upload-artifact@v4
-      with:
-        name: Anomaly-Runtime-and-Tools
-        path: .build\windows-vs2022\game-package
-        retention-days: 7
+      - name: Show toolchain and disk
+        run: |
+          cmake --version
+          Write-Host ("PowerShell {0}" -f $PSVersionTable.PSVersion)
+          Get-PSDrive C | Select-Object Used, Free | Format-List
 
-    - name: 6. 上传 SDK 开发包
-      uses: actions/upload-artifact@v4
-      with:
-        name: Anomaly-SDK
-        path: .build\sdk-package
-        retention-days: 7
+      - name: Configure (preset windows-vs2022)
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          # ANOMALY_RELEASE_VERSION 必须和稍后传给 package_release.ps1 的 -Version 一致，
+          # 否则打包脚本会以 “release version does not match configured project version” 失败。
+          cmake --preset windows-vs2022 "-DANOMALY_RELEASE_VERSION=$env:VERSION"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Build (preset windows-relwithdebinfo)
+        run: |
+          cmake --build --preset windows-relwithdebinfo --parallel
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Package Runtime, SDK and Tools
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          $output = Join-Path $env:RELEASE_ROOT $env:VERSION
+          pwsh -NoProfile -File .\tools\package_release.ps1 `
+            -BuildDirectory $env:BUILD_DIR `
+            -Version $env:VERSION `
+            -OutputDirectory $output
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Verify the three component archives
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+
+          $output = Join-Path $env:RELEASE_ROOT $env:VERSION
+          # 归档条目是相对组件暂存目录的路径（不含顶层目录名），用前后通配匹配，
+          # 避免布局微调时误报。期望值取自 CMakeLists.txt 的 install(... COMPONENT ...)。
+          $archives = [ordered]@{
+            "Anomaly-$($env:VERSION)-runtime.zip" = @(
+              '*dwmapi.dll', '*Anomaly.Core.dll', '*Anomaly/anomaly.ini',
+              '*Anomaly/plugins/*/plugin.dll', '*AnomalyLauncher.exe')
+            "Anomaly-$($env:VERSION)-sdk.zip"     = @(
+              '*include/anomaly/sdk/*')
+            "Anomaly-$($env:VERSION)-tools.zip"   = @(
+              '*anomaly-cli.exe', '*anomaly-inspect.exe', '*anomaly-plugin.exe',
+              '*anomaly-profile.exe', '*anomaly-abi-snapshot.exe', '*anomaly-test-host.exe')
+          }
+
+          foreach ($name in $archives.Keys) {
+            $path = Join-Path $output $name
+            if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
+              throw "缺少组件归档: $path"
+            }
+
+            $zip = [IO.Compression.ZipFile]::OpenRead($path)
+            try {
+              $entries = @($zip.Entries | ForEach-Object { $_.FullName })
+            }
+            finally {
+              $zip.Dispose()
+            }
+            if ($entries.Count -eq 0) { throw "$name 是空的" }
+
+            foreach ($expected in $archives[$name]) {
+              if (-not ($entries | Where-Object { $_ -like $expected })) {
+                throw "$name 中找不到 $expected（实际条目数 $($entries.Count)）"
+              }
+            }
+
+            Write-Host ("{0}  {1:N1} MiB  {2} entries" -f $name,
+              ((Get-Item -LiteralPath $path).Length / 1MB), $entries.Count)
+          }
+
+          $sums = Join-Path $output 'SHA256SUMS.txt'
+          if (-not (Test-Path -LiteralPath $sums)) { throw "缺少校验文件: $sums" }
+          Get-Content -LiteralPath $sums
+
+      - name: Upload Runtime
+        uses: actions/upload-artifact@v4
+        with:
+          name: Anomaly-Runtime
+          path: .build/release/${{ steps.version.outputs.version }}/Anomaly-${{ steps.version.outputs.version }}-runtime.zip
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 30
+
+      - name: Upload SDK
+        uses: actions/upload-artifact@v4
+        with:
+          name: Anomaly-SDK
+          path: .build/release/${{ steps.version.outputs.version }}/Anomaly-${{ steps.version.outputs.version }}-sdk.zip
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 30
+
+      - name: Upload Tools
+        uses: actions/upload-artifact@v4
+        with:
+          name: Anomaly-Tools
+          path: .build/release/${{ steps.version.outputs.version }}/Anomaly-${{ steps.version.outputs.version }}-tools.zip
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 30
+
+      - name: Upload checksums, manifest and SBOM
+        uses: actions/upload-artifact@v4
+        with:
+          name: Anomaly-Release-Metadata
+          path: |
+            .build/release/${{ steps.version.outputs.version }}/SHA256SUMS.txt
+            .build/release/${{ steps.version.outputs.version }}/release-manifest.json
+            .build/release/${{ steps.version.outputs.version }}/sbom/*.spdx.json
+          if-no-files-found: error
+          retention-days: 30
