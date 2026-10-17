@@ -16,22 +16,29 @@ jobs:
     - name: 2. 设置 MSBuild 环境
       uses: microsoft/setup-msbuild@v2
 
-    - name: 3. 运行官方构建脚本 (编译所有内容)
-      run: .\build.cmd
+    - name: 3. 初始化 MSVC 编译环境
+      uses: ilammy/msvc-dev-cmd@v1
 
-    - name: 4. 提取并安装 SDK 组件
+    - name: 4. 运行官方构建脚本 (编译所有内容)
+      shell: cmd
       run: |
-        # 单独把开发者需要的 SDK 提取到 sdk-package 文件夹
+        echo [INFO] 开始运行 build.cmd...
+        call .\build.cmd
+
+    - name: 5. 提取并安装 SDK 组件
+      shell: cmd
+      run: |
+        echo [INFO] 正在提取 SDK...
         cmake --install .build\windows-vs2022 --config RelWithDebInfo --prefix .build\sdk-package --component SDK
 
-    - name: 5. 打包 Runtime 运行环境与 Tools 辅助工具
+    - name: 6. 打包成品 (Runtime 运行环境与 Tools 辅助工具)
       uses: actions/upload-artifact@v4
       with:
         name: Anomaly-Runtime-and-Tools
         path: .build\windows-vs2022\game-package
         retention-days: 7
 
-    - name: 6. 打包 SDK 开发工具包
+    - name: 7. 打包成品 (SDK 开发工具包)
       uses: actions/upload-artifact@v4
       with:
         name: Anomaly-SDK
