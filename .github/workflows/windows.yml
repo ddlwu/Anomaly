@@ -1,44 +1,44 @@
 name: Build Anomaly (Runtime, SDK, Tools)
 
 on:
-  workflow_dispatch: # 允许你手动点击按钮运行
+  workflow_dispatch:
 
 jobs:
   build:
-    runs-on: windows-latest # 使用微软最新的 Windows 服务器
+    runs-on: windows-2022 # 固定使用自带 VS 2022 的镜像环境
 
     steps:
     - name: 1. 获取代码
       uses: actions/checkout@v4
       with:
-        submodules: recursive # 拉取子模块
+        submodules: recursive
 
-    - name: 2. 设置 MSBuild 环境
-      uses: microsoft/setup-msbuild@v2
-
-    - name: 3. 初始化 MSVC 编译环境
-      uses: ilammy/msvc-dev-cmd@v1
-
-    - name: 4. 运行官方构建脚本 (编译所有内容)
+    - name: 2. 初始化 Visual Studio 编译环境
       shell: cmd
       run: |
-        echo [INFO] 开始运行 build.cmd...
+        call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\Common7\Tools\VsDevCmd.bat"
+        cmake --version
+
+    - name: 3. 运行官方构建脚本 (编译 Runtime 与 Tools)
+      shell: cmd
+      run: |
+        call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\Common7\Tools\VsDevCmd.bat"
         call .\build.cmd
 
-    - name: 5. 提取并安装 SDK 组件
+    - name: 4. 提取并安装 SDK 组件
       shell: cmd
       run: |
-        echo [INFO] 正在提取 SDK...
+        call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\Common7\Tools\VsDevCmd.bat"
         cmake --install .build\windows-vs2022 --config RelWithDebInfo --prefix .build\sdk-package --component SDK
 
-    - name: 6. 打包成品 (Runtime 运行环境与 Tools 辅助工具)
+    - name: 5. 上传 Runtime 与 Tools 运行包
       uses: actions/upload-artifact@v4
       with:
         name: Anomaly-Runtime-and-Tools
         path: .build\windows-vs2022\game-package
         retention-days: 7
 
-    - name: 7. 打包成品 (SDK 开发工具包)
+    - name: 6. 上传 SDK 开发包
       uses: actions/upload-artifact@v4
       with:
         name: Anomaly-SDK
